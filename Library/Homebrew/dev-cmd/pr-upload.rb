@@ -3,7 +3,6 @@
 
 require "cli/parser"
 require "archive"
-require "bintray"
 require "github_packages"
 require "github_releases"
 
@@ -18,8 +17,6 @@ module Homebrew
       description <<~EOS
         Apply the bottle commit and publish bottles to a host.
       EOS
-      switch "--no-publish",
-             description: "Apply the bottle commit and upload the bottles, but don't publish them."
       switch "--keep-old",
              description: "If the formula specifies a rebuild version, " \
                           "attempt to preserve its value in the generated DSL."
@@ -34,12 +31,13 @@ module Homebrew
              description: "Specify a committer name and email in `git`'s standard author format."
       flag   "--archive-item=",
              description: "Upload to the specified Internet Archive item (default: `homebrew`)."
-      flag   "--bintray-org=",
-             description: "Upload to the specified Bintray organisation (default: `homebrew`)."
       flag   "--github-org=",
              description: "Upload to the specified GitHub organisation's GitHub Packages (default: `homebrew`)."
       flag   "--root-url=",
              description: "Use the specified <URL> as the root of the bottle's URL instead of Homebrew's default."
+      flag   "--root-url-using=",
+             description: "Use the specified download strategy class for downloading the bottle's URL instead of "\
+                          "Homebrew's default."
 
       named_args :none
     end
@@ -62,12 +60,6 @@ module Homebrew
     end
   end
 
-  def bintray?(bottles_hash)
-    @bintray ||= bottles_hash.values.all? do |bottle_hash|
-      bottle_hash["bottle"]["root_url"].match? Bintray::URL_REGEX
-    end
-  end
-
   def github_releases?(bottles_hash)
     @github_releases ||= bottles_hash.values.all? do |bottle_hash|
       root_url = bottle_hash["bottle"]["root_url"]
@@ -84,27 +76,28 @@ module Homebrew
     end
   end
 
-  def json_files_and_bottles_hash_(root_url)
-    json_files = Dir["*.bottle.json"]
-    odie "No bottle JSON files found in the current working directory" if json_files.blank?
+  def bottles_hash_from_json_files(json_files, args)
+    puts "Reading JSON files: #{json_files.join(", ")}" if args.verbose?
 
     bottles_hash = json_files.reduce({}) do |hash, json_file|
       hash.deep_merge(JSON.parse(File.read(json_file)))
     end
 
-    if root_url
+    if args.root_url
       bottles_hash.each_value do |bottle_hash|
-        bottle_hash["bottle"]["root_url"] = root_url
+        bottle_hash["bottle"]["root_url"] = args.root_url
       end
     end
 
-    [json_files, bottles_hash]
+    bottles_hash
   end
 
   def pr_upload
     args = pr_upload_args.parse
 
-    json_files, bottles_hash = json_files_and_bottles_hash_(args.root_url)
+    json_files = Dir["*.bottle.json"]
+    odie "No bottle JSON files found in the current working directory" if json_files.blank?
+    bottles_hash = bottles_hash_from_json_files(json_files, args)
 
     bottle_args = ["bottle", "--merge", "--write"]
     bottle_args << "--verbose" if args.verbose?
@@ -113,6 +106,7 @@ module Homebrew
     bottle_args << "--root-url=#{args.root_url}" if args.root_url
     bottle_args << "--committer=#{args.committer}" if args.committer
     bottle_args << "--no-commit" if args.no_commit?
+    bottle_args << "--root-url-using=#{args.root_url_using}" if args.root_url_using
     bottle_args += json_files
 
     if args.dry_run?
@@ -121,8 +115,6 @@ module Homebrew
         nil
       elsif internet_archive?(bottles_hash)
         "Internet Archive"
-      elsif bintray?(bottles_hash)
-        "Bintray"
       elsif github_releases?(bottles_hash)
         "GitHub Releases"
       else
@@ -141,11 +133,21 @@ module Homebrew
 
     check_bottled_formulae!(bottles_hash)
 
+    # This will be run by `brew bottle` and `brew audit` later so run it first
+    # to not start spamming during normal output.
+    Homebrew.install_bundler_gems!
+
     safe_system HOMEBREW_BREW_FILE, *bottle_args
+
+    json_files = Dir["*.bottle.json"]
+    if json_files.blank?
+      puts "No bottle JSON files after merge, no upload needed!"
+      return
+    end
 
     # Reload the JSON files (in case `brew bottle --merge` generated
     # `all: $SHA256` bottles)
-    _, bottles_hash = json_files_and_bottles_hash_(args.root_url)
+    bottles_hash = bottles_hash_from_json_files(json_files, args)
 
     # Check the bottle commits did not break `brew audit`
     unless args.no_commit?
@@ -161,14 +163,6 @@ module Homebrew
       archive = Archive.new(item: archive_item)
       archive.upload_bottles(bottles_hash,
                              warn_on_error: args.warn_on_upload_failure?)
-    elsif bintray?(bottles_hash)
-      odeprecated "brew pr-upload for Bintray (Bintray will be shut down on 1st May 2021)"
-
-      bintray_org = args.bintray_org || "homebrew"
-      bintray = Bintray.new(org: bintray_org)
-      bintray.upload_bottles(bottles_hash,
-                             publish_package: !args.no_publish?,
-                             warn_on_error:   args.warn_on_upload_failure?)
     elsif github_releases?(bottles_hash)
       github_releases = GitHubReleases.new
       github_releases.upload_bottles(bottles_hash)
